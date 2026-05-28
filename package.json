@@ -1,0 +1,16 @@
+{
+  "name": "pi-telegram-connector",
+  "version": "1.0.0",
+  "description": "Telegram connector for pi-coding-agent — chat with pi through Telegram",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs",
+    "dev": "node --watch index.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.2"
+  },
+  "keywords": ["pi", "telegram", "connector", "coding-agent"],
+  "license": "Apache-2.0"
+}
