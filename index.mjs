@@ -16,8 +16,8 @@
  */
 
 import { createAgentSession } from "@earendil-works/pi-coding-agent";
-import { resolve, basename } from "node:path";
-import { readFileSync } from "node:fs";
+import { resolve, basename, extname } from "node:path";
+import { readFileSync, existsSync, statSync } from "node:fs";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -103,7 +103,7 @@ async function sendPhoto(chatId, filePath, caption) {
     parts.push(encoder.encode(
       `--${boundary}\r\n` +
       `Content-Disposition: form-data; name="photo"; filename="${fileName}"\r\n` +
-      `Content-Type: image/png\r\n\r\n`
+      `Content-Type: ${imageMimeType(filePath)}\r\n\r\n`
     ));
     parts.push(fileBuffer);
     parts.push(encoder.encode(`\r\n`));
@@ -150,6 +150,129 @@ async function sendPhoto(chatId, filePath, caption) {
   }
 }
 
+/** Image file extensions we can send to Telegram */
+const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
+
+/**
+ * Get the MIME type for an image file based on its extension.
+ */
+function imageMimeType(filePath) {
+  const ext = extname(filePath).toLowerCase();
+  switch (ext) {
+    case ".png": return "image/png";
+    case ".jpg":
+    case ".jpeg": return "image/jpeg";
+    case ".gif": return "image/gif";
+    case ".webp": return "image/webp";
+    default: return "application/octet-stream";
+  }
+}
+
+/**
+ * Extract image file paths from text.
+ * Looks for paths ending in common image extensions that actually exist on disk.
+ * Returns an array of { path, ext } objects.
+ */
+function extractImagePaths(text) {
+  // Match anything that looks like a file path ending with an image extension.
+  // This includes paths in backticks, quotes, or bare words.
+  const imagePathRegex = /`([^`]+\.(?:png|jpg|jpeg|gif|webp))`|"([^"]+\.(?:png|jpg|jpeg|gif|webp))"|'([^']+\.(?:png|jpg|jpeg|gif|webp))'|([\w./\\-]+\.(?:png|jpg|jpeg|gif|webp))/gi;
+
+  const found = [];
+  const seen = new Set();
+  let match;
+
+  while ((match = imagePathRegex.exec(text)) !== null) {
+    // Pick the first non-undefined capture group
+    const rawPath = match[1] || match[2] || match[3] || match[4];
+    if (!rawPath) continue;
+
+    // Try to resolve relative to CWD
+    const candidates = [
+      rawPath,
+      resolve(CWD, rawPath),
+      resolve(CWD, basename(rawPath)),
+    ];
+
+    for (const candidate of candidates) {
+      try {
+        if (existsSync(candidate) && statSync(candidate).isFile()) {
+          const ext = extname(candidate).toLowerCase();
+          if (IMAGE_EXTENSIONS.has(ext) && !seen.has(candidate)) {
+            found.push({ path: candidate, ext });
+            seen.add(candidate);
+          }
+          break; // Found a valid file, stop checking candidates
+        }
+      } catch {
+        // Ignore errors (e.g., invalid paths)
+      }
+    }
+  }
+
+  return found;
+}
+
+/**
+ * Send an "upload_photo" chat action so the user knows we're sending an image.
+ */
+async function sendUploadPhoto(chatId) {
+  await tg("sendChatAction", {
+    chat_id: chatId,
+    action: "upload_photo",
+  }).catch(() => {});
+}
+
+/**
+ * Send a response that may contain both text and images.
+ * If image paths are found in the text, they are sent as photos
+ * and the remaining text is sent as a regular message.
+ */
+async function sendRichResponse(chatId, text) {
+  if (!text) {
+    await sendMessage(chatId, "✅ Done.");
+    return;
+  }
+
+  const images = extractImagePaths(text);
+
+  if (images.length === 0) {
+    // No images — just send as text
+    await sendMessage(chatId, text);
+    return;
+  }
+
+  // We have images! Remove the image paths from the text for the caption.
+  // Remove backtick-wrapped paths first, then bare paths
+  let cleanText = text;
+  for (const img of images) {
+    // Remove backtick-wrapped version
+    cleanText = cleanText.replace(new RegExp("`" + escapeRegex(img.path) + "`", "g"), "");
+    cleanText = cleanText.replace(new RegExp("`" + escapeRegex(basename(img.path)) + "`", "g"), "");
+    // Remove bare path version
+    cleanText = cleanText.replace(new RegExp(escapeRegex(img.path), "g"), "");
+    cleanText = cleanText.replace(new RegExp(escapeRegex(basename(img.path)), "g"), "");
+  }
+  // Clean up extra whitespace/newlines left after removal
+  cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/^\s+|\s+$/g, "");
+
+  // Send the first image with the clean text as caption, rest as separate photos
+  await sendUploadPhoto(chatId);
+  await sendPhoto(chatId, images[0].path, cleanText || undefined);
+
+  for (let i = 1; i < images.length; i++) {
+    await sendUploadPhoto(chatId);
+    await sendPhoto(chatId, images[i].path);
+  }
+}
+
+/**
+ * Escape special regex characters in a string.
+ */
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 // ─── Pi Session ──────────────────────────────────────────────────────────────
 
 async function initPiSession() {
@@ -165,13 +288,16 @@ async function initPiSession() {
   }
 }
 
-async function processWithPi(message) {
+async function processWithPi(message, options = {}) {
   if (!piSession) {
-    return "⚠️ pi is not initialized yet. Please wait and try again.";
+    return { text: "⚠️ pi is not initialized yet. Please wait and try again.", images: [] };
   }
 
   try {
     const parts = [];
+
+    // Snapshot PNG files before pi runs
+    const beforePngs = await collectPngFiles();
 
     const unsubscribe = piSession.subscribe((event) => {
       if (
@@ -182,18 +308,96 @@ async function processWithPi(message) {
       }
     });
 
-    await piSession.prompt(message);
+    // If we have images to send to pi, include them via prompt options
+    const promptOptions = {};
+    if (options.images && options.images.length > 0) {
+      promptOptions.images = options.images;
+    }
+
+    await piSession.prompt(message, promptOptions);
 
     // Small delay to ensure all events are processed
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 200));
 
     unsubscribe();
 
-    return parts.join("") || "✅ Done.";
+    const text = parts.join("") || "✅ Done.";
+
+    // Find newly created PNG files by comparing before/after snapshots
+    const afterPngs = await collectPngFiles();
+    const newPngs = [];
+    for (const f of afterPngs) {
+      if (!beforePngs.has(f)) {
+        newPngs.push(f);
+      }
+    }
+
+    // Also find image paths mentioned in the response text
+    const textImages = extractImagePaths(text).map((i) => i.path);
+
+    // Combine: newly created files + paths found in text (deduplicated)
+    const allImages = [...new Set([...newPngs, ...textImages])];
+
+    return { text, images: allImages };
   } catch (err) {
     console.error("❌ pi processing error:", err.message);
-    return `⚠️ Error processing with pi: ${err.message}`;
+    return { text: `⚠️ Error processing with pi: ${err.message}`, images: [] };
   }
+}
+
+/**
+ * Recursively collect all .png file paths in CWD.
+ * @returns {Promise<Set<string>>}
+ */
+async function collectPngFiles() {
+  const paths = new Set();
+  try {
+    const { readdirSync } = await import("node:fs");
+    const { join } = await import("node:path");
+
+    function walk(dir) {
+      let entries;
+      try {
+        entries = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          // Skip node_modules and .git
+          if (entry.name !== "node_modules" && entry.name !== ".git" && !entry.name.startsWith(".")) {
+            walk(full);
+          }
+        } else if (entry.name.toLowerCase().endsWith(".png")) {
+          paths.add(full);
+        }
+      }
+    }
+
+    walk(CWD);
+  } catch {
+    // If anything fails, return empty set
+  }
+  return paths;
+}
+
+/**
+ * Download a file from Telegram by file_id and return its buffer.
+ * @param {string} fileId
+ * @returns {Promise<Buffer>}
+ */
+async function downloadTelegramFile(fileId) {
+  const fileResp = await tg("getFile", { file_id: fileId });
+  if (!fileResp.ok || !fileResp.result?.file_path) {
+    throw new Error(`Failed to get file path: ${JSON.stringify(fileResp)}`);
+  }
+  const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileResp.result.file_path}`;
+  const res = await fetch(fileUrl);
+  if (!res.ok) {
+    throw new Error(`Failed to download file: ${res.status}`);
+  }
+  return Buffer.from(await res.arrayBuffer());
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -231,14 +435,60 @@ async function main() {
 
         const msg = update.message;
         if (!msg) continue;
-
-        // Skip non-text messages and bot's own messages
-        if (!msg.text) continue;
         if (msg.from?.is_bot) continue;
 
         const chatId = msg.chat.id;
-        const text = msg.text.trim();
         const fromName = msg.from?.first_name || "unknown";
+
+        // Handle photo messages — download and send to pi for vision processing
+        if (msg.photo) {
+          const photoInfo = msg.photo[msg.photo.length - 1]; // highest resolution
+          const caption = msg.caption || "What's in this image?";
+          console.log(
+            `\n📸 Photo from ${fromName} (chat ${chatId}): ${caption.slice(0, 100)}`,
+          );
+
+          sendTyping(chatId);
+
+          try {
+            // Download the photo from Telegram
+            const photoBuffer = await downloadTelegramFile(photoInfo.file_id);
+            const base64 = photoBuffer.toString("base64");
+
+            // Send to pi with the image for vision analysis
+            const { text, images: piCreatedImages } = await processWithPi(caption, {
+              images: [{
+                type: "image",
+                source: {
+                  type: "base64",
+                  mediaType: "image/jpeg",
+                  data: base64,
+                },
+              }],
+            });
+
+            // Send pi's text response
+            const reply = text || "✅ Done.";
+            await sendMessage(chatId, reply);
+
+            // Send any images pi created
+            for (const imgPath of piCreatedImages) {
+              await sendUploadPhoto(chatId);
+              await sendPhoto(chatId, imgPath);
+            }
+
+            console.log(`📤 Response sent to chat ${chatId}`);
+          } catch (err) {
+            console.error("❌ Photo processing error:", err.message);
+            await sendMessage(chatId, `⚠️ Error processing photo: ${err.message}`);
+          }
+          continue;
+        }
+
+        // Skip non-text messages
+        if (!msg.text) continue;
+
+        const text = msg.text.trim();
 
         console.log(
           `\n📨 Telegram message from ${fromName} (chat ${chatId}): ${text.slice(0, 100)}${text.length > 100 ? "..." : ""}`,
@@ -301,7 +551,7 @@ async function main() {
           sendTyping(chatId);
 
           // Ask pi to summarize the conversation so far
-          const summary = await processWithPi(
+          const { text: summary } = await processWithPi(
             "Please provide a concise summary of our entire conversation so far, " +
             "capturing all key information, decisions, code changes, and context. " +
             "This summary will be used to restore context after a session reset."
@@ -350,11 +600,20 @@ async function main() {
         sendTyping(chatId);
 
         // Process with pi
-        const response = await processWithPi(text);
+        const { text: response, images: createdImages } = await processWithPi(text);
 
-        // Send response back — always send a message on completion
+        // Send response text — auto-detect image paths mentioned in text
         const reply = response || "✅ Done.";
-        await sendMessage(chatId, reply);
+        await sendRichResponse(chatId, reply);
+
+        // Send any newly created images pi generated (not already sent by sendRichResponse)
+        for (const imgPath of createdImages) {
+          // skip if already handled by sendRichResponse (path was in text)
+          if (reply.includes(imgPath) || reply.includes(basename(imgPath))) continue;
+          await sendUploadPhoto(chatId);
+          await sendPhoto(chatId, imgPath, "📸 Here's the image I created:");
+        }
+
         console.log(
           `📤 Response sent to chat ${chatId}: ${reply.slice(0, 100)}${reply.length > 100 ? "..." : ""}`,
         );
