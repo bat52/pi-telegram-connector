@@ -16,7 +16,8 @@
  */
 
 import { createAgentSession } from "@earendil-works/pi-coding-agent";
-import { resolve } from "node:path";
+import { resolve, basename } from "node:path";
+import { readFileSync } from "node:fs";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -79,6 +80,74 @@ async function sendTyping(chatId) {
     chat_id: chatId,
     action: "typing",
   }).catch(() => {});
+}
+
+async function sendPhoto(chatId, filePath, caption) {
+  try {
+    const fileBuffer = readFileSync(filePath);
+    const boundary = "----FormBoundary" + Math.random().toString(36).slice(2);
+    const fileName = basename(filePath);
+
+    // Build multipart body
+    const encoder = new TextEncoder();
+    const parts = [];
+
+    // chat_id field
+    parts.push(encoder.encode(
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="chat_id"\r\n\r\n` +
+      `${chatId}\r\n`
+    ));
+
+    // photo field (file upload)
+    parts.push(encoder.encode(
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="photo"; filename="${fileName}"\r\n` +
+      `Content-Type: image/png\r\n\r\n`
+    ));
+    parts.push(fileBuffer);
+    parts.push(encoder.encode(`\r\n`));
+
+    // caption field (optional)
+    if (caption) {
+      parts.push(encoder.encode(
+        `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="caption"\r\n\r\n` +
+        `${caption}\r\n`
+      ));
+    }
+
+    // End boundary
+    parts.push(encoder.encode(`--${boundary}--\r\n`));
+
+    // Concatenate all parts
+    const totalLength = parts.reduce((sum, p) => sum + p.byteLength, 0);
+    const body = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const p of parts) {
+      body.set(p, offset);
+      offset += p.byteLength;
+    }
+
+    const res = await fetch(`${API_BASE}/sendPhoto`, {
+      method: "POST",
+      headers: {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": totalLength.toString(),
+      },
+      body: body,
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Telegram API error (${res.status}): ${text}`);
+    }
+    return res.json();
+  } catch (err) {
+    console.error("❌ Failed to send photo:", err.message);
+    // Fallback: send error message
+    await sendMessage(chatId, `⚠️ Failed to send image: ${err.message}`);
+  }
 }
 
 // ─── Pi Session ──────────────────────────────────────────────────────────────
