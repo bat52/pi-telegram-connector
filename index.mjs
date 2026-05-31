@@ -349,6 +349,44 @@ async function processWithPi(message, options = {}) {
 }
 
 /**
+ * Execute a pi slash command directly via the session, without LLM processing.
+ * Pi's internal commands (/model, /session, /settings, /skill:*, etc.) execute
+ * immediately via extension command handlers and manage their own output.
+ * @param {string} command - The full command text (e.g. "/model", "/session")
+ * @returns {Promise<string>} - The command output text
+ */
+async function processPiCommand(command) {
+  if (!piSession) {
+    return "⚠️ pi is not initialized yet. Please wait and try again.";
+  }
+
+  try {
+    const parts = [];
+
+    const unsubscribe = piSession.subscribe((event) => {
+      if (
+        event.type === "message_update" &&
+        event.assistantMessageEvent.type === "text_delta"
+      ) {
+        parts.push(event.assistantMessageEvent.delta);
+      }
+    });
+
+    await piSession.prompt(command);
+
+    // Small delay to ensure all events are processed
+    await new Promise((r) => setTimeout(r, 200));
+
+    unsubscribe();
+
+    return parts.join("").trim() || "✅ Command completed.";
+  } catch (err) {
+    console.error("❌ pi command error:", err.message);
+    return `⚠️ Error executing command: ${err.message}`;
+  }
+}
+
+/**
  * Recursively collect all .png file paths in CWD.
  * @returns {Promise<Set<string>>}
  */
@@ -527,9 +565,9 @@ async function main() {
             "`/start` — Start the bot and see welcome message",
             "`/help` — Show this help message",
             "`/status` — Check connection status",
-            "`/new` — Start a fresh conversation (reset context)",
-            "`/compact` — Compact conversation history for pi\n",
-            "_Any other message will be sent to pi for processing._",
+            "`/<command>` — Any pi command (e.g. /model, /session, /settings, /skill:name)",
+            "`!<command>` — Execute a shell command\n",
+            "_Otherwise the message is sent to pi for AI processing._",
           ].join("\n");
           await sendMessage(chatId, help);
           continue;
@@ -544,58 +582,16 @@ async function main() {
           continue;
         }
 
-        // Handle /compact command — summarize conversation and reset session
-        if (text === "/compact") {
-          if (!piSession) {
-            await sendMessage(chatId, "⚠️ No active session to compact.");
-            continue;
-          }
-          await sendMessage(chatId, "🧹 Compacting conversation history...");
+        // Handle all other pi slash commands — forward to piSession.prompt() directly.
+        // Pi's internal commands (/model, /session, /settings, /skill:*, /compact,
+        // /new, /fork, /tree, etc.) execute immediately without LLM, except /compact
+        // which internally uses the LLM (the documented exception).
+        if (text.startsWith("/")) {
+          console.log(`🎯 Pi command: ${text}`);
           sendTyping(chatId);
-
-          // Ask pi to summarize the conversation so far
-          const { text: summary } = await processWithPi(
-            "Please provide a concise summary of our entire conversation so far, " +
-            "capturing all key information, decisions, code changes, and context. " +
-            "This summary will be used to restore context after a session reset."
-          );
-
-          // Reset the session
-          if (piSession) {
-            piSession.dispose();
-            piSession = null;
-          }
-          await initPiSession();
-
-          // Feed the summary back as the new context
-          sendTyping(chatId);
-          await piSession.prompt(
-            "[Previous conversation summary — this is a compacted restoration of " +
-            "the prior context]\n\n" + summary
-          );
-
-          await sendMessage(chatId,
-            "✅ Conversation compacted! The summary has been loaded as context.\n\n" +
-            "*Summary:*\n" + summary
-          );
-          console.log(`🧹 Conversation compacted for chat ${chatId}`);
-          continue;
-        }
-
-        // Handle /new command — reset pi session
-        if (text === "/new") {
-          await sendMessage(chatId, "🔄 Resetting pi session...");
-          if (piSession) {
-            piSession.dispose();
-            piSession = null;
-          }
-          try {
-            await initPiSession();
-            await sendMessage(chatId, "✅ Session reset! You're starting fresh.");
-          } catch (err) {
-            await sendMessage(chatId, `⚠️ Failed to reset session: ${err.message}`);
-          }
-          console.log(`🔄 Session reset for chat ${chatId}`);
+          const output = await processPiCommand(text);
+          await sendMessage(chatId, output);
+          console.log(`📤 Pi command response sent to chat ${chatId}`);
           continue;
         }
 
