@@ -18,6 +18,8 @@
 import { createAgentSession } from "@earendil-works/pi-coding-agent";
 import { resolve, basename, extname } from "node:path";
 import { readFileSync, existsSync, statSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { execSync } from "node:child_process";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -271,6 +273,34 @@ async function sendRichResponse(chatId, text) {
  */
 function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// ─── Shell Command Execution ─────────────────────────────────────────────────
+
+/**
+ * Execute a shell command and return its output.
+ * @param {string} command - The shell command to execute (without the leading !)
+ * @returns {Promise<string>} - The stdout (or stderr if error)
+ */
+async function executeShellCommand(command) {
+  const trimmed = command.trim();
+  if (!trimmed) {
+    return "⚠️ Empty command. Usage: `!<shell command>`";
+  }
+  try {
+    const result = execSync(trimmed, {
+      cwd: CWD,
+      encoding: "utf-8",
+      timeout: 30000, // 30 second timeout
+      maxBuffer: 1024 * 1024, // 1MB output limit
+    });
+    return result || "✅ Command completed (no output).";
+  } catch (err) {
+    const stderr = err.stderr || "";
+    const stdout = err.stdout || "";
+    const message = stderr || stdout || err.message;
+    return `❌ Command failed (exit code ${err.status || "?"}):\n\`\`\`\n${message.trim()}\n\`\`\``;
+  }
 }
 
 // ─── Pi Session ──────────────────────────────────────────────────────────────
@@ -593,6 +623,54 @@ async function main() {
             await sendMessage(chatId, `⚠️ Failed to reset session: ${err.message}`);
           }
           console.log(`🔄 Session reset for chat ${chatId}`);
+          continue;
+        }
+
+        // Handle shell commands (messages starting with !)
+        if (text.startsWith("!")) {
+          const shellCommand = text.slice(1);
+          console.log(`💻 Shell command: ${shellCommand}`);
+          sendTyping(chatId);
+          const output = await executeShellCommand(shellCommand);
+          await sendMessage(chatId, output);
+          console.log(`📤 Shell output sent to chat ${chatId}`);
+          continue;
+        }
+
+        // Handle shell commands — messages starting with !
+        if (text.startsWith("!")) {
+          const shellCmd = text.slice(1).trim();
+          console.log(`🐚 Shell command: ${shellCmd}`);
+          sendTyping(chatId);
+
+          // Safety: allow only safe commands? No — the user has shell access already.
+          // Just execute and return output.
+          // We default to a 30s timeout to prevent runaway commands.
+          try {
+            const output = execSync(shellCmd, {
+              cwd: CWD,
+              timeout: 30_000,
+              encoding: "utf-8",
+              maxBuffer: 10 * 1024 * 1024, // 10MB
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+            const stdout = output?.trim() || "";
+            if (stdout) {
+              await sendMessage(chatId, stdout);
+            } else {
+              // If stdout is empty, send stderr (or a done message)
+              await sendMessage(chatId, "✅ Command completed (no output).");
+            }
+          } catch (err) {
+            const errorMsg = err.stderr?.toString().trim() || err.message;
+            const stdout = err.stdout?.toString().trim();
+            let reply = `❌ Command failed:\n\`\`\`\n${errorMsg}\n\`\`\``;
+            if (stdout) {
+              reply += `\n\n*stdout:*\n\`\`\`\n${stdout.slice(0, 3500)}\n\`\`\``;
+            }
+            await sendMessage(chatId, reply);
+          }
+          console.log(`🐚 Shell command completed for chat ${chatId}`);
           continue;
         }
 
