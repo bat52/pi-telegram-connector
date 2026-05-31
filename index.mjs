@@ -19,7 +19,6 @@ import { createAgentSession } from "@earendil-works/pi-coding-agent";
 import { resolve, basename, extname } from "node:path";
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { execSync } from "node:child_process";
-import { execSync } from "node:child_process";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -276,32 +275,6 @@ function escapeRegex(str) {
 }
 
 // ─── Shell Command Execution ─────────────────────────────────────────────────
-
-/**
- * Execute a shell command and return its output.
- * @param {string} command - The shell command to execute (without the leading !)
- * @returns {Promise<string>} - The stdout (or stderr if error)
- */
-async function executeShellCommand(command) {
-  const trimmed = command.trim();
-  if (!trimmed) {
-    return "⚠️ Empty command. Usage: `!<shell command>`";
-  }
-  try {
-    const result = execSync(trimmed, {
-      cwd: CWD,
-      encoding: "utf-8",
-      timeout: 30000, // 30 second timeout
-      maxBuffer: 1024 * 1024, // 1MB output limit
-    });
-    return result || "✅ Command completed (no output).";
-  } catch (err) {
-    const stderr = err.stderr || "";
-    const stdout = err.stdout || "";
-    const message = stderr || stdout || err.message;
-    return `❌ Command failed (exit code ${err.status || "?"}):\n\`\`\`\n${message.trim()}\n\`\`\``;
-  }
-}
 
 // ─── Pi Session ──────────────────────────────────────────────────────────────
 
@@ -623,17 +596,6 @@ async function main() {
             await sendMessage(chatId, `⚠️ Failed to reset session: ${err.message}`);
           }
           console.log(`🔄 Session reset for chat ${chatId}`);
-          continue;
-        }
-
-        // Handle shell commands (messages starting with !)
-        if (text.startsWith("!")) {
-          const shellCommand = text.slice(1);
-          console.log(`💻 Shell command: ${shellCommand}`);
-          sendTyping(chatId);
-          const output = await executeShellCommand(shellCommand);
-          await sendMessage(chatId, output);
-          console.log(`📤 Shell output sent to chat ${chatId}`);
           continue;
         }
 
